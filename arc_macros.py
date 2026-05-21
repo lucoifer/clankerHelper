@@ -13,6 +13,8 @@ Notes:
 from __future__ import annotations
 
 import ctypes
+import json
+from pathlib import Path
 import traceback
 from ctypes import wintypes
 import time
@@ -78,13 +80,17 @@ DISPLAY_BOOST_TOGGLE_KEY = "comma"
 REGISTER_DISPLAY_BOOST_WHILE_SHIFT_HELD = True
 
 # Display boost values.
-# This uses a temporary Windows gamma ramp overlay, not your monitor hardware.
+# Hardware brightness targets the Windows primary monitor only.
+# Gamma targets the Windows primary display DC only, when the driver allows it.
+DISPLAY_USE_HARDWARE_BRIGHTNESS = True
+DISPLAY_USE_GAMMA_RAMP = True
 DISPLAY_BRIGHTNESS_BOOST_PERCENT = 10
 DISPLAY_GAMMA_BOOST_PERCENT = 35
 
 # Pausing/exiting restores the original display ramp.
 RESTORE_DISPLAY_WHEN_PAUSED = True
 RESTORE_DISPLAY_ON_EXIT = True
+RESTORE_DISPLAY_STATE_ON_START = True
 
 # Delays. These are fixed, based on the midpoint of your XML values:
 # 234-244 ms -> 239 ms, 64-72 ms -> 68 ms, 64-71 ms -> 68 ms.
@@ -102,10 +108,16 @@ DELAY_AFTER_SHIFT_RESTORE_MS = 10
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+try:
+    dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
+except OSError:
+    dxva2 = None
 user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
 user32.GetAsyncKeyState.restype = ctypes.c_short
 
 INPUT_KEYBOARD = 1
+CCHDEVICENAME = 32
+MONITORINFOF_PRIMARY = 0x00000001
 WH_KEYBOARD_LL = 13
 HC_ACTION = 0
 WM_KEYDOWN = 0x0100
@@ -190,6 +202,8 @@ macros_paused = START_MACROS_PAUSED
 autorun_enabled = False
 display_boost_enabled = False
 original_gamma_ramp = None
+original_monitor_brightness = None
+display_boost_components: set[str] = set()
 registered_hotkeys: dict[int, tuple[str, str]] = {}
 physical_keys_down: set[str] = set()
 pause_combo_is_down = False
@@ -254,6 +268,23 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     )
 
 
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = (
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * CCHDEVICENAME),
+    )
+
+
+class PHYSICAL_MONITOR(ctypes.Structure):
+    _fields_ = (
+        ("hPhysicalMonitor", wintypes.HANDLE),
+        ("szPhysicalMonitorDescription", wintypes.WCHAR * 128),
+    )
+
+
 GammaChannel = wintypes.WORD * 256
 
 
@@ -266,6 +297,13 @@ class GammaRamp(ctypes.Structure):
 
 
 LRESULT = ctypes.c_ssize_t
+MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL,
+    wintypes.HANDLE,
+    wintypes.HDC,
+    ctypes.POINTER(wintypes.RECT),
+    wintypes.LPARAM,
+)
 HOOKPROC = ctypes.WINFUNCTYPE(
     LRESULT,
     ctypes.c_int,
@@ -291,14 +329,59 @@ user32.CallNextHookEx.argtypes = (
 user32.CallNextHookEx.restype = LRESULT
 user32.UnhookWindowsHookEx.argtypes = (wintypes.HANDLE,)
 user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+user32.EnumDisplayMonitors.argtypes = (
+    wintypes.HDC,
+    ctypes.POINTER(wintypes.RECT),
+    MONITORENUMPROC,
+    wintypes.LPARAM,
+)
+user32.EnumDisplayMonitors.restype = wintypes.BOOL
+user32.GetMonitorInfoW.argtypes = (wintypes.HANDLE, ctypes.POINTER(MONITORINFOEXW))
+user32.GetMonitorInfoW.restype = wintypes.BOOL
 user32.GetDC.argtypes = (wintypes.HWND,)
 user32.GetDC.restype = wintypes.HDC
 user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
 user32.ReleaseDC.restype = ctypes.c_int
+gdi32.CreateDCW.argtypes = (
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    ctypes.c_void_p,
+)
+gdi32.CreateDCW.restype = wintypes.HDC
+gdi32.DeleteDC.argtypes = (wintypes.HDC,)
+gdi32.DeleteDC.restype = wintypes.BOOL
 gdi32.GetDeviceGammaRamp.argtypes = (wintypes.HDC, ctypes.POINTER(GammaRamp))
 gdi32.GetDeviceGammaRamp.restype = wintypes.BOOL
 gdi32.SetDeviceGammaRamp.argtypes = (wintypes.HDC, ctypes.POINTER(GammaRamp))
 gdi32.SetDeviceGammaRamp.restype = wintypes.BOOL
+
+if dxva2 is not None:
+    dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+    dxva2.GetPhysicalMonitorsFromHMONITOR.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(PHYSICAL_MONITOR),
+    )
+    dxva2.GetPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+    dxva2.DestroyPhysicalMonitors.argtypes = (
+        wintypes.DWORD,
+        ctypes.POINTER(PHYSICAL_MONITOR),
+    )
+    dxva2.DestroyPhysicalMonitors.restype = wintypes.BOOL
+    dxva2.GetMonitorBrightness.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    dxva2.GetMonitorBrightness.restype = wintypes.BOOL
+    dxva2.SetMonitorBrightness.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    dxva2.SetMonitorBrightness.restype = wintypes.BOOL
 
 
 def msleep(milliseconds: int) -> None:
@@ -362,31 +445,205 @@ def set_autorun(enabled: bool) -> None:
     print(f"\nAutorun {'ON' if autorun_enabled else 'OFF'}")
 
 
-def get_gamma_ramp() -> GammaRamp:
-    hdc = user32.GetDC(None)
+def api_failure(function_name: str) -> RuntimeError:
+    error_code = ctypes.get_last_error()
+    if error_code:
+        message = ctypes.FormatError(error_code).strip()
+        return RuntimeError(f"{function_name} failed: {message} (WinError {error_code})")
+
+    return RuntimeError(f"{function_name} failed; the driver returned no error code")
+
+
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def get_primary_monitor() -> tuple[int, str]:
+    primary_monitor: dict[str, int | str] = {}
+
+    @MONITORENUMPROC
+    def enum_proc(hmonitor, hdc, rect, data):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            if info.dwFlags & MONITORINFOF_PRIMARY:
+                primary_monitor["handle"] = hmonitor
+                primary_monitor["device"] = info.szDevice
+                return False
+        return True
+
+    ctypes.set_last_error(0)
+    user32.EnumDisplayMonitors(None, None, enum_proc, 0)
+
+    if "handle" not in primary_monitor:
+        raise api_failure("EnumDisplayMonitors/GetMonitorInfoW")
+
+    return int(primary_monitor["handle"]), str(primary_monitor["device"])
+
+
+def create_primary_display_dc() -> wintypes.HDC:
+    _, device_name = get_primary_monitor()
+
+    hdc = gdi32.CreateDCW(None, device_name, None, None)
     if not hdc:
-        raise ctypes.WinError(ctypes.get_last_error())
+        hdc = gdi32.CreateDCW("DISPLAY", device_name, None, None)
+    if not hdc:
+        raise api_failure(f"CreateDCW for primary display {device_name}")
+
+    return hdc
+
+
+def get_gamma_ramp() -> GammaRamp:
+    hdc = create_primary_display_dc()
 
     ramp = GammaRamp()
     try:
+        ctypes.set_last_error(0)
         if not gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(ramp)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise api_failure("GetDeviceGammaRamp for primary display")
     finally:
-        user32.ReleaseDC(None, hdc)
+        gdi32.DeleteDC(hdc)
 
     return ramp
 
 
 def set_gamma_ramp(ramp: GammaRamp) -> None:
-    hdc = user32.GetDC(None)
-    if not hdc:
-        raise ctypes.WinError(ctypes.get_last_error())
+    hdc = create_primary_display_dc()
 
     try:
+        ctypes.set_last_error(0)
         if not gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise api_failure("SetDeviceGammaRamp for primary display")
     finally:
-        user32.ReleaseDC(None, hdc)
+        gdi32.DeleteDC(hdc)
+
+
+def open_primary_physical_monitors():
+    if dxva2 is None:
+        raise RuntimeError("dxva2.dll is not available on this Windows install")
+
+    hmonitor, _ = get_primary_monitor()
+    count = wintypes.DWORD()
+
+    ctypes.set_last_error(0)
+    if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(
+        hmonitor,
+        ctypes.byref(count),
+    ):
+        raise api_failure("GetNumberOfPhysicalMonitorsFromHMONITOR")
+    if count.value == 0:
+        raise RuntimeError("Windows did not expose a physical monitor for the primary display")
+
+    monitors = (PHYSICAL_MONITOR * count.value)()
+    ctypes.set_last_error(0)
+    if not dxva2.GetPhysicalMonitorsFromHMONITOR(hmonitor, count, monitors):
+        raise api_failure("GetPhysicalMonitorsFromHMONITOR")
+
+    return monitors, count.value
+
+
+def destroy_physical_monitors(monitors, count: int) -> None:
+    if dxva2 is not None and monitors is not None and count:
+        dxva2.DestroyPhysicalMonitors(count, monitors)
+
+
+def get_primary_monitor_brightness() -> list[tuple[int, int, int]]:
+    monitors = None
+    count = 0
+    values: list[tuple[int, int, int]] = []
+
+    try:
+        monitors, count = open_primary_physical_monitors()
+        for index in range(count):
+            minimum = wintypes.DWORD()
+            current = wintypes.DWORD()
+            maximum = wintypes.DWORD()
+
+            ctypes.set_last_error(0)
+            if not dxva2.GetMonitorBrightness(
+                monitors[index].hPhysicalMonitor,
+                ctypes.byref(minimum),
+                ctypes.byref(current),
+                ctypes.byref(maximum),
+            ):
+                raise api_failure("GetMonitorBrightness for primary monitor")
+
+            values.append((minimum.value, current.value, maximum.value))
+    finally:
+        destroy_physical_monitors(monitors, count)
+
+    return values
+
+
+def set_primary_monitor_brightness_values(target_values: list[int]) -> None:
+    monitors = None
+    count = 0
+
+    try:
+        monitors, count = open_primary_physical_monitors()
+        if count < len(target_values):
+            raise RuntimeError("Primary monitor handle count changed before brightness restore")
+
+        for index, target_value in enumerate(target_values):
+            ctypes.set_last_error(0)
+            if not dxva2.SetMonitorBrightness(
+                monitors[index].hPhysicalMonitor,
+                wintypes.DWORD(target_value),
+            ):
+                raise api_failure("SetMonitorBrightness for primary monitor")
+    finally:
+        destroy_physical_monitors(monitors, count)
+
+
+def build_boosted_brightness_values(
+    brightness_values: list[tuple[int, int, int]],
+) -> list[int]:
+    boosted_values = []
+
+    for minimum, current, maximum in brightness_values:
+        boost_amount = round((maximum - minimum) * (DISPLAY_BRIGHTNESS_BOOST_PERCENT / 100))
+        boosted_values.append(clamp_int(current + boost_amount, minimum, maximum))
+
+    return boosted_values
+
+
+def display_restore_state_path() -> Path:
+    return Path(__file__).with_suffix(".display_restore.json")
+
+
+def save_display_restore_state(brightness_values: list[tuple[int, int, int]]) -> None:
+    state = {
+        "primary_monitor_brightness": [
+            current for _, current, _ in brightness_values
+        ],
+    }
+    display_restore_state_path().write_text(json.dumps(state), encoding="utf-8")
+
+
+def clear_display_restore_state() -> None:
+    try:
+        display_restore_state_path().unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"\nCould not remove display restore state file: {exc}")
+
+
+def restore_display_state_from_file() -> None:
+    if not RESTORE_DISPLAY_STATE_ON_START:
+        return
+
+    state_path = display_restore_state_path()
+    if not state_path.exists():
+        return
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        brightness_values = state.get("primary_monitor_brightness")
+        if brightness_values:
+            set_primary_monitor_brightness_values([int(value) for value in brightness_values])
+            print("\nRestored primary monitor brightness from previous run.")
+        clear_display_restore_state()
+    except Exception as exc:
+        print(f"\nCould not restore saved display state: {exc}")
 
 
 def build_boosted_gamma_ramp(base_ramp: GammaRamp) -> GammaRamp:
@@ -414,19 +671,79 @@ def build_boosted_gamma_ramp(base_ramp: GammaRamp) -> GammaRamp:
 
 
 def set_display_boost(enabled: bool) -> None:
-    global display_boost_enabled, original_gamma_ramp
+    global display_boost_enabled, original_gamma_ramp, original_monitor_brightness
 
     if enabled == display_boost_enabled:
         return
 
     if enabled:
-        original_gamma_ramp = get_gamma_ramp()
-        set_gamma_ramp(build_boosted_gamma_ramp(original_gamma_ramp))
-    elif original_gamma_ramp is not None:
-        set_gamma_ramp(original_gamma_ramp)
+        warnings: list[str] = []
+        display_boost_components.clear()
+        original_monitor_brightness = None
+        original_gamma_ramp = None
 
-    display_boost_enabled = enabled
-    print(f"\nDisplay boost {'ON' if display_boost_enabled else 'OFF'}")
+        if DISPLAY_USE_HARDWARE_BRIGHTNESS:
+            try:
+                original_monitor_brightness = get_primary_monitor_brightness()
+                save_display_restore_state(original_monitor_brightness)
+                set_primary_monitor_brightness_values(
+                    build_boosted_brightness_values(original_monitor_brightness)
+                )
+                display_boost_components.add("brightness")
+            except Exception as exc:
+                if original_monitor_brightness is not None:
+                    try:
+                        original_values = [current for _, current, _ in original_monitor_brightness]
+                        set_primary_monitor_brightness_values(original_values)
+                        clear_display_restore_state()
+                    except Exception:
+                        pass
+                original_monitor_brightness = None
+                warnings.append(f"brightness unavailable: {exc}")
+
+        if DISPLAY_USE_GAMMA_RAMP:
+            try:
+                original_gamma_ramp = get_gamma_ramp()
+                set_gamma_ramp(build_boosted_gamma_ramp(original_gamma_ramp))
+                display_boost_components.add("gamma")
+            except Exception as exc:
+                original_gamma_ramp = None
+                warnings.append(f"gamma unavailable: {exc}")
+
+        display_boost_enabled = bool(display_boost_components)
+        if display_boost_enabled:
+            parts = " + ".join(sorted(display_boost_components))
+            print(f"\nDisplay boost ON ({parts})")
+        else:
+            print("\nDisplay boost could not be enabled.")
+
+        for warning in warnings:
+            print(f"  {warning}")
+        return
+
+    warnings = []
+
+    if "gamma" in display_boost_components and original_gamma_ramp is not None:
+        try:
+            set_gamma_ramp(original_gamma_ramp)
+        except Exception as exc:
+            warnings.append(f"gamma restore failed: {exc}")
+
+    if "brightness" in display_boost_components and original_monitor_brightness is not None:
+        try:
+            original_values = [current for _, current, _ in original_monitor_brightness]
+            set_primary_monitor_brightness_values(original_values)
+            clear_display_restore_state()
+        except Exception as exc:
+            warnings.append(f"brightness restore failed: {exc}")
+
+    display_boost_components.clear()
+    original_gamma_ramp = None
+    original_monitor_brightness = None
+    display_boost_enabled = False
+    print("\nDisplay boost OFF")
+    for warning in warnings:
+        print(f"  {warning}")
 
 
 def tap_quick_use_slot(slot_key: str) -> None:
@@ -669,6 +986,7 @@ def uninstall_keyboard_hook() -> None:
 
 
 def main() -> None:
+    restore_display_state_from_file()
     if not macros_paused:
         enable_hotkeys()
     install_keyboard_hook()
