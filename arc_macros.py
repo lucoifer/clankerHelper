@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import msvcrt
 from pathlib import Path
 import traceback
 from ctypes import wintypes
@@ -22,15 +23,50 @@ import time
 
 # --- User settings --------------------------------------------------------
 
-# Hotkey key -> quick-use slot key.
-# Example: "x": "6" means pressing X sends Left Alt + 6.
-HOTKEYS = {
+# Profile picker. Press 1/2/3 within this many seconds after launch.
+ENABLE_PROFILE_PICKER = True
+PROFILE_PICK_TIMEOUT_SECONDS = 5
+DEFAULT_PROFILE_NAME = "Luci"
+PROFILE_ORDER = ("Luci", "SM", "Zak")
+PROFILE_COLORS = {
+    "Luci": "magenta",
+    "SM": "cyan",
+    "Zak": "green",
+}
+
+# Default quick-use binds. Profiles below copy this until you give me each
+# person's real binds.
+DEFAULT_HOTKEYS = {
     "3": "3",
     "4": "4",
     "5": "5",
     "6": "6",
     "x": "6",
 }
+
+# Each profile can have its own hotkeys and toggle keys.
+# Example: "x": "6" means pressing X sends Left Alt + 6.
+PROFILES = {
+    "Luci": {
+        "hotkeys": DEFAULT_HOTKEYS.copy(),
+        "autorun_toggle_key": "backquote",
+        "display_boost_toggle_key": "b",
+    },
+    "SM": {
+        "hotkeys": DEFAULT_HOTKEYS.copy(),
+        "autorun_toggle_key": "backquote",
+        "display_boost_toggle_key": "b",
+    },
+    "Zak": {
+        "hotkeys": DEFAULT_HOTKEYS.copy(),
+        "autorun_toggle_key": "backquote",
+        "display_boost_toggle_key": "b",
+    },
+}
+
+# Active settings. These are filled from the selected profile at startup.
+ACTIVE_PROFILE_NAME = DEFAULT_PROFILE_NAME
+HOTKEYS = DEFAULT_HOTKEYS.copy()
 
 # Which key opens your quick-use menu.
 QUICK_USE_HOLD_KEY = "left_alt"
@@ -74,7 +110,7 @@ PAUSE_TOGGLE_KEYS = ("left_ctrl", "left_shift")
 RELEASE_AUTORUN_WHEN_PAUSED = True
 
 # Press this key to toggle display boost on/off.
-DISPLAY_BOOST_TOGGLE_KEY = "comma"
+DISPLAY_BOOST_TOGGLE_KEY = "b"
 
 # Lets the display boost toggle work while Shift is held.
 REGISTER_DISPLAY_BOOST_WHILE_SHIFT_HELD = True
@@ -85,7 +121,7 @@ REGISTER_DISPLAY_BOOST_WHILE_SHIFT_HELD = True
 DISPLAY_USE_HARDWARE_BRIGHTNESS = True
 DISPLAY_USE_GAMMA_RAMP = True
 DISPLAY_BRIGHTNESS_BOOST_PERCENT = 10
-DISPLAY_GAMMA_BOOST_PERCENT = 35
+DISPLAY_GAMMA_BOOST_PERCENT = 42
 
 # Pausing/exiting restores the original display ramp.
 RESTORE_DISPLAY_WHEN_PAUSED = True
@@ -117,6 +153,8 @@ user32.GetAsyncKeyState.restype = ctypes.c_short
 
 INPUT_KEYBOARD = 1
 CCHDEVICENAME = 32
+STD_OUTPUT_HANDLE = -11
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 MONITORINFOF_PRIMARY = 0x00000001
 WH_KEYBOARD_LL = 13
 HC_ACTION = 0
@@ -144,6 +182,7 @@ VK_CODES = {
     "7": 0x37,
     "8": 0x38,
     "9": 0x39,
+    "b": 0x42,
     "w": 0x57,
     "x": 0x58,
     "backquote": 0xC0,
@@ -165,6 +204,7 @@ SCAN_CODES = {
     "7": 0x08,
     "8": 0x09,
     "9": 0x0A,
+    "b": 0x30,
     "w": 0x11,
     "x": 0x2D,
     "backquote": 0x29,
@@ -178,6 +218,7 @@ SCAN_CODES = {
 
 SHIFT_KEYS = ("left_shift", "right_shift")
 KEY_LABELS = {
+    "b": "B",
     "backquote": "`",
     "comma": ",",
     "left_alt": "Left Alt",
@@ -329,6 +370,12 @@ user32.CallNextHookEx.argtypes = (
 user32.CallNextHookEx.restype = LRESULT
 user32.UnhookWindowsHookEx.argtypes = (wintypes.HANDLE,)
 user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+kernel32.GetStdHandle.argtypes = (wintypes.DWORD,)
+kernel32.GetStdHandle.restype = wintypes.HANDLE
+kernel32.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+kernel32.GetConsoleMode.restype = wintypes.BOOL
+kernel32.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+kernel32.SetConsoleMode.restype = wintypes.BOOL
 user32.EnumDisplayMonitors.argtypes = (
     wintypes.HDC,
     ctypes.POINTER(wintypes.RECT),
@@ -430,6 +477,162 @@ def key_label(key_name: str) -> str:
     return KEY_LABELS.get(key_name, key_name.upper() if len(key_name) == 1 else key_name)
 
 
+COLORS = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[96m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "red": "\033[91m",
+    "magenta": "\033[95m",
+    "blue": "\033[94m",
+    "white": "\033[97m",
+}
+
+
+def enable_console_colors() -> None:
+    handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+    if not handle:
+        return
+
+    mode = wintypes.DWORD()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        kernel32.SetConsoleMode(
+            handle,
+            mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        )
+
+
+def color(text: str, color_name: str) -> str:
+    return f"{COLORS.get(color_name, '')}{text}{COLORS['reset']}"
+
+
+def profile_label(profile_name: str) -> str:
+    return color(profile_name, PROFILE_COLORS.get(profile_name, "white"))
+
+
+def status(text: str, color_name: str = "cyan") -> None:
+    print(color(text, color_name))
+
+
+def print_rule() -> None:
+    print(color("=" * 58, "blue"))
+
+
+def print_banner() -> None:
+    print()
+    print_rule()
+    print(color("ARC RAIDERS QUICK-USE HELPER", "cyan"))
+    print(color("profile binds | autorun | display boost | pause toggle", "dim"))
+    print_rule()
+
+
+def apply_profile(profile_name: str) -> None:
+    global ACTIVE_PROFILE_NAME, HOTKEYS, AUTORUN_TOGGLE_KEY, DISPLAY_BOOST_TOGGLE_KEY
+
+    profile = PROFILES.get(profile_name, PROFILES[DEFAULT_PROFILE_NAME])
+    ACTIVE_PROFILE_NAME = profile_name if profile_name in PROFILES else DEFAULT_PROFILE_NAME
+    HOTKEYS = dict(profile.get("hotkeys", DEFAULT_HOTKEYS))
+    AUTORUN_TOGGLE_KEY = profile.get("autorun_toggle_key", AUTORUN_TOGGLE_KEY)
+    DISPLAY_BOOST_TOGGLE_KEY = profile.get(
+        "display_boost_toggle_key",
+        DISPLAY_BOOST_TOGGLE_KEY,
+    )
+
+
+def choose_profile_name() -> str:
+    if not ENABLE_PROFILE_PICKER:
+        return DEFAULT_PROFILE_NAME
+
+    choices = {
+        str(index): profile_name
+        for index, profile_name in enumerate(PROFILE_ORDER, start=1)
+        if profile_name in PROFILES
+    }
+
+    print_banner()
+    print(color("Choose profile:", "white"))
+    for number, profile_name in choices.items():
+        default_marker = "  default" if profile_name == DEFAULT_PROFILE_NAME else ""
+        print(f"  {color(number, 'yellow')}  {profile_label(profile_name)}{color(default_marker, 'dim')}")
+    print()
+
+    deadline = time.monotonic() + PROFILE_PICK_TIMEOUT_SECONDS
+    last_remaining = None
+
+    while True:
+        remaining = max(0, int(deadline - time.monotonic() + 0.999))
+        if remaining != last_remaining:
+            print(
+                "\r"
+                + color(
+                    f"Press 1/2/3 within {remaining}s, or wait for {DEFAULT_PROFILE_NAME}...",
+                    "dim",
+                ),
+                end="",
+                flush=True,
+            )
+            last_remaining = remaining
+
+        if msvcrt.kbhit():
+            key = msvcrt.getwch()
+            if key in choices:
+                print()
+                selected = choices[key]
+                print(f"Selected profile: {profile_label(selected)}")
+                return selected
+            if key in ("\r", "\n"):
+                print()
+                print(f"Selected default profile: {profile_label(DEFAULT_PROFILE_NAME)}")
+                return DEFAULT_PROFILE_NAME
+
+        if time.monotonic() >= deadline:
+            print()
+            print(f"No profile selected. Defaulting to {profile_label(DEFAULT_PROFILE_NAME)}.")
+            return DEFAULT_PROFILE_NAME
+
+        time.sleep(0.05)
+
+
+def print_active_layout() -> None:
+    quick_use_label = key_label(QUICK_USE_HOLD_KEY)
+    print()
+    print_rule()
+    print(f"Profile: {profile_label(ACTIVE_PROFILE_NAME)}")
+    print(color(f"Macros: {'PAUSED' if macros_paused else 'ENABLED'}", "green" if not macros_paused else "yellow"))
+    print_rule()
+
+    print(color("Quick Use", "cyan"))
+    for hotkey_key, slot_key in HOTKEYS.items():
+        print(f"  {key_label(hotkey_key):>7} -> {quick_use_label} + {slot_key}")
+        if REGISTER_HOTKEYS_WHILE_SHIFT_HELD:
+            print(f"  {'Shift+' + key_label(hotkey_key):>7} -> {quick_use_label} + {slot_key}")
+
+    if AUTORUN_TOGGLE_KEY:
+        held_keys = " + ".join(key_label(key_name) for key_name in AUTORUN_HOLD_KEYS)
+        print(color("Autorun", "cyan"))
+        print(f"  {key_label(AUTORUN_TOGGLE_KEY):>7} -> toggle {held_keys}")
+        if USE_PHYSICAL_HOOK_FOR_AUTORUN_TOGGLE:
+            print(color("          physical key detection enabled", "dim"))
+
+    if DISPLAY_BOOST_TOGGLE_KEY:
+        print(color("Display", "cyan"))
+        print(
+            f"  {key_label(DISPLAY_BOOST_TOGGLE_KEY):>7} -> "
+            f"+{DISPLAY_BRIGHTNESS_BOOST_PERCENT}% brightness / "
+            f"+{DISPLAY_GAMMA_BOOST_PERCENT}% gamma"
+        )
+
+    if ENABLE_PAUSE_TOGGLE:
+        pause_keys = " + ".join(key_label(key_name) for key_name in PAUSE_TOGGLE_KEYS)
+        print(color("Safety", "cyan"))
+        print(f"  {pause_keys} -> pause/resume macros")
+
+    print_rule()
+    print(color("Press Ctrl+C in this window to stop.", "dim"))
+
+
 def set_autorun(enabled: bool) -> None:
     global autorun_enabled
 
@@ -442,7 +645,7 @@ def set_autorun(enabled: bool) -> None:
         release_keys(reversed(AUTORUN_HOLD_KEYS))
 
     autorun_enabled = enabled
-    print(f"\nAutorun {'ON' if autorun_enabled else 'OFF'}")
+    status(f"\nAutorun {'ON' if autorun_enabled else 'OFF'}", "green" if autorun_enabled else "yellow")
 
 
 def api_failure(function_name: str) -> RuntimeError:
@@ -624,7 +827,7 @@ def clear_display_restore_state() -> None:
     try:
         display_restore_state_path().unlink(missing_ok=True)
     except OSError as exc:
-        print(f"\nCould not remove display restore state file: {exc}")
+        status(f"\nCould not remove display restore state file: {exc}", "yellow")
 
 
 def restore_display_state_from_file() -> None:
@@ -640,10 +843,10 @@ def restore_display_state_from_file() -> None:
         brightness_values = state.get("primary_monitor_brightness")
         if brightness_values:
             set_primary_monitor_brightness_values([int(value) for value in brightness_values])
-            print("\nRestored primary monitor brightness from previous run.")
+            status("\nRestored primary monitor brightness from previous run.", "green")
         clear_display_restore_state()
     except Exception as exc:
-        print(f"\nCould not restore saved display state: {exc}")
+        status(f"\nCould not restore saved display state: {exc}", "yellow")
 
 
 def build_boosted_gamma_ramp(base_ramp: GammaRamp) -> GammaRamp:
@@ -713,12 +916,12 @@ def set_display_boost(enabled: bool) -> None:
         display_boost_enabled = bool(display_boost_components)
         if display_boost_enabled:
             parts = " + ".join(sorted(display_boost_components))
-            print(f"\nDisplay boost ON ({parts})")
+            status(f"\nDisplay boost ON ({parts})", "green")
         else:
-            print("\nDisplay boost could not be enabled.")
+            status("\nDisplay boost could not be enabled.", "red")
 
         for warning in warnings:
-            print(f"  {warning}")
+            status(f"  {warning}", "yellow")
         return
 
     warnings = []
@@ -741,9 +944,9 @@ def set_display_boost(enabled: bool) -> None:
     original_gamma_ramp = None
     original_monitor_brightness = None
     display_boost_enabled = False
-    print("\nDisplay boost OFF")
+    status("\nDisplay boost OFF", "yellow")
     for warning in warnings:
-        print(f"  {warning}")
+        status(f"  {warning}", "yellow")
 
 
 def tap_quick_use_slot(slot_key: str) -> None:
@@ -797,9 +1000,23 @@ def register_key_action(
         modifiers_to_register.append(MOD_SHIFT | MOD_NOREPEAT)
 
     for modifiers in modifiers_to_register:
+        hotkey_label = key_label(hotkey_key)
+        if modifiers & MOD_SHIFT:
+            hotkey_label = f"Shift + {hotkey_label}"
+
+        ctypes.set_last_error(0)
         ok = user32.RegisterHotKey(None, hotkey_id, modifiers, VK_CODES[hotkey_key])
         if not ok:
-            raise ctypes.WinError(ctypes.get_last_error())
+            error_code = ctypes.get_last_error()
+            if error_code == 1409:
+                status(
+                    f"\nWarning: {hotkey_label} is already registered by another app/script, so I skipped it.",
+                    "yellow",
+                )
+                status("Close any older macro CMD windows if you expected this key to work here.", "dim")
+                continue
+
+            raise ctypes.WinError(error_code)
 
         hotkey_ids[hotkey_id] = (action_type, action_value)
         hotkey_id += 1
@@ -864,6 +1081,11 @@ def enable_hotkeys() -> None:
 
     if not registered_hotkeys:
         registered_hotkeys = register_hotkeys()
+        if not registered_hotkeys:
+            status(
+                "\nNo global hotkeys were registered. Another macro window may still be running.",
+                "yellow",
+            )
 
 
 def disable_hotkeys() -> None:
@@ -884,10 +1106,10 @@ def toggle_macros_paused() -> None:
             set_autorun(False)
         if RESTORE_DISPLAY_WHEN_PAUSED:
             set_display_boost(False)
-        print("\nMacros PAUSED")
+        status("\nMacros PAUSED", "yellow")
     else:
         enable_hotkeys()
-        print("\nMacros RESUMED")
+        status("\nMacros RESUMED", "green")
 
 
 def toggle_autorun_from_hook() -> None:
@@ -986,33 +1208,13 @@ def uninstall_keyboard_hook() -> None:
 
 
 def main() -> None:
+    enable_console_colors()
+    apply_profile(choose_profile_name())
     restore_display_state_from_file()
     if not macros_paused:
         enable_hotkeys()
     install_keyboard_hook()
-    print("ARC quick-use helper running.")
-    print(f"Macros start {'PAUSED' if macros_paused else 'ENABLED'}.")
-    print("Active hotkeys:")
-    for hotkey_key, slot_key in HOTKEYS.items():
-        quick_use_label = key_label(QUICK_USE_HOLD_KEY)
-        print(f"  {key_label(hotkey_key)} -> {quick_use_label} + {slot_key}")
-        if REGISTER_HOTKEYS_WHILE_SHIFT_HELD:
-            print(f"  Shift + {key_label(hotkey_key)} -> {quick_use_label} + {slot_key}")
-    if AUTORUN_TOGGLE_KEY:
-        held_keys = " + ".join(key_label(key_name) for key_name in AUTORUN_HOLD_KEYS)
-        print(f"  {key_label(AUTORUN_TOGGLE_KEY)} -> toggle {held_keys}")
-        if USE_PHYSICAL_HOOK_FOR_AUTORUN_TOGGLE:
-            print("    autorun toggle uses physical key detection")
-    if DISPLAY_BOOST_TOGGLE_KEY:
-        print(
-            f"  {key_label(DISPLAY_BOOST_TOGGLE_KEY)} -> toggle "
-            f"+{DISPLAY_BRIGHTNESS_BOOST_PERCENT}% brightness / "
-            f"+{DISPLAY_GAMMA_BOOST_PERCENT}% gamma"
-        )
-    if ENABLE_PAUSE_TOGGLE:
-        pause_keys = " + ".join(key_label(key_name) for key_name in PAUSE_TOGGLE_KEYS)
-        print(f"  {pause_keys} -> pause/resume macros")
-    print("Press Ctrl+C in this window to stop.")
+    print_active_layout()
 
     msg = wintypes.MSG()
     try:
