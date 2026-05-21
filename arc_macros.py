@@ -75,7 +75,7 @@ PROFILES: dict[str, dict] = {
         "display_boost_toggle_key":    "b",
     },
     "SM": {
-        "quick_use_hold_key":          "left_alt",
+        "quick_use_hold_key":          "q,
         "hotkeys": {
             "3": "3",
             "4": "4",
@@ -260,6 +260,7 @@ VK_CODES: dict[str, int] = {
     "4": 0x34, "5": 0x35, "6": 0x36, "7": 0x37,
     "8": 0x38, "9": 0x39,
     "b":          0x42,
+    "q":          0x51,
     "w":          0x57,
     "x":          0x58,
     "z":          0x5A,
@@ -278,6 +279,7 @@ SCAN_CODES: dict[str, int] = {
     "4": 0x05, "5": 0x06, "6": 0x07, "7": 0x08,
     "8": 0x09, "9": 0x0A,
     "b":           0x30,
+    "q":           0x10,
     "tab":         0x0F,
     "w":           0x11,
     "x":           0x2D,
