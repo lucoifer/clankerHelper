@@ -83,7 +83,7 @@ PROFILES: dict[str, dict] = {
             "6": "6",
         },
         "transfer_to_quickuse_key":    "x",
-        "transfer_to_safepocket_key":  "z",
+        "transfer_to_safepocket_key":  "",
         "safe_pocket_pos":             (1607, 838),
         "quick_use_slot_pos":          (1607, 479),
         "inventory_key":               "tab",
