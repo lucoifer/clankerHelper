@@ -75,7 +75,7 @@ PROFILES: dict[str, dict] = {
         "display_boost_toggle_key":    "b",
     },
     "SM": {
-        "quick_use_hold_key":          "q,
+        "quick_use_hold_key":          "q",
         "hotkeys": {
             "3": "3",
             "4": "4",
