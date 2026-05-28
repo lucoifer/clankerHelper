@@ -59,7 +59,7 @@ REFERENCE_SCREEN_HEIGHT = 1152
 
 PROFILES: dict[str, dict] = {
     "Luci": {
-        "quick_use_hold_key":          "left_alt",
+        "quick_use_hold_key":          "v",
         "hotkeys": {
             "3": "3",
             "4": "4",
@@ -106,6 +106,22 @@ PROFILES: dict[str, dict] = {
         "autorun_toggle_key":          "backquote",
         "display_boost_toggle_key":    "b",
     },
+    "Priima": {
+        "quick_use_hold_key":          "q",
+        "hotkeys": {
+            "3": "3",
+            "4": "4",
+            "5": "5",
+            "6": "6",
+        },
+        "transfer_to_quickuse_key":    "x",
+        "transfer_to_safepocket_key":  "z",
+        "safe_pocket_pos":             (1607, 838),
+        "quick_use_slot_pos":          (1607, 479),
+        "inventory_key":               "tab",
+        "autorun_toggle_key":          "backquote",
+        "display_boost_toggle_key":    "b",
+    },
 }
 
 
@@ -115,11 +131,12 @@ PROFILES: dict[str, dict] = {
 ENABLE_PROFILE_PICKER        = True
 PROFILE_PICK_TIMEOUT_SECONDS = 5
 DEFAULT_PROFILE_NAME         = "Luci"
-PROFILE_ORDER                = ("Luci", "SM", "Zak")
+PROFILE_ORDER                = ("Luci", "SM", "Zak", "Priima")
 PROFILE_COLORS               = {
-    "Luci": "magenta",
-    "SM":   "cyan",
-    "Zak":  "green",
+    "Luci":   "magenta",
+    "SM":     "cyan",
+    "Zak":    "green",
+    "Priima": "yellow",
 }
 
 
@@ -262,6 +279,7 @@ VK_CODES: dict[str, int] = {
     "b":          0x42,
     "q":          0x51,
     "w":          0x57,
+    "v":          0x56,
     "x":          0x58,
     "z":          0x5A,
     "backquote":  0xC0,
@@ -279,6 +297,7 @@ SCAN_CODES: dict[str, int] = {
     "4": 0x05, "5": 0x06, "6": 0x07, "7": 0x08,
     "8": 0x09, "9": 0x0A,
     "b":           0x30,
+    "v":           0x2F,
     "q":           0x10,
     "tab":         0x0F,
     "w":           0x11,
@@ -299,6 +318,7 @@ KEY_LABELS: dict[str, str] = {
     "b":           "B",
     "backquote":   "`",
     "comma":       ",",
+    "v":           "V",
     "left_alt":    "Left Alt",
     "left_ctrl":   "Left Ctrl",
     "right_ctrl":  "Right Ctrl",
@@ -723,7 +743,7 @@ def choose_profile_name() -> str:
         if remaining != last_remaining:
             print(
                 "\r" + color(
-                    f"Press 1/2/3 within {remaining}s, or wait for {DEFAULT_PROFILE_NAME}...",
+                    f"Press {'/'.join(choices)} within {remaining}s, or wait for {DEFAULT_PROFILE_NAME}...",
                     "dim",
                 ),
                 end="", flush=True,
